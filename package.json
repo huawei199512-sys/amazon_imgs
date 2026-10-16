@@ -1,0 +1,19 @@
+{
+  "name": "amazon-product-api",
+  "version": "1.0.0",
+  "description": "Amazon商品详情和关键字搜索API - 支持全球多站点",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test_full.js"
+  },
+  "dependencies": {
+    "express": "^4.18.0",
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12",
+    "cors": "^2.8.5",
+    "http-proxy-agent": "^7.0.2",
+    "https-proxy-agent": "^7.0.4",
+    "socks-proxy-agent": "^7.0.0"
+  }
+}
