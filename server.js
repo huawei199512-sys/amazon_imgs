@@ -1,157 +1,168 @@
 const express = require('express');
 const cors = require('cors');
-const scraper = require('./scraper');
-const sites = require('./sites');
 const proxyManager = require('./proxy');
+const sites = require('./sites');
+const { searchByImage, DATA_VERSION } = require('./imageSearch');
+const guard = require('./guard');
+
 const app = express();
-const PORT = process.env.PORT || 8000;
+const PORT = process.env.PORT || 8001;
+
+app.set('trust proxy', 1);
 app.use(cors());
-app.use(express.json());
-// ============ 全局错误防护（防止未捕获异常导致服务崩溃）============
-process.on('uncaughtException', (err) => {
-  console.error('[UncaughtException]', err.message);
+// 5MB图片 base64 约 6.7MB，给10MB上限
+app.use(express.json({ limit: '10mb' }));
+
+// 基础安全响应头
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  next();
 });
-process.on('unhandledRejection', (err) => {
-  console.error('[UnhandledRejection]', err && err.message ? err.message : err);
-});
-// ============ 健康检查端点（Render 必需，必须最先注册）============
+
+// 全局异常防护（单请求异常不导致进程崩溃）
+process.on('uncaughtException', err => console.error('[UncaughtException]', err.message));
+process.on('unhandledRejection', err => console.error('[UnhandledRejection]', err && err.message ? err.message : err));
+
+// 客户端限流（每IP每分钟12次图搜）
+const limiter = new guard.RateLimiter(12, 60000);
+
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', uptime: process.uptime() });
 });
-// ============ 首页 ============
+
 app.get('/', (req, res) => {
   res.json({
-    service: 'Amazon Product API',
-    version: '2.0.0 (Pro)',
-    description: 'Amazon商品详情和关键字搜索API - 纯代理模式',
-    mode: 'proxy',
-    features: {
-      proxy_mode: '纯代理模式（所有请求通过代理IP）',
-      supported_sites: sites.getAllSiteKeys(),
-      search_params: {
-        keyword: '搜索关键字（必填）',
-        country: '站点代码，如: com, jp, de, co.uk, fr, it, es, ca',
-        lang: '语言代码，如: en, ja, de, fr, zh',
-        page: '页码，从1开始',
-      },
-      product_params: {
-        asin: '商品ASIN（路径参数）',
-        country: '站点代码',
-        lang: '语言代码',
-      },
+    service: 'Amazon Image Search API',
+    data_version: DATA_VERSION,
+    description: 'Amazon图搜API（Shop the Look / StyleSnap 匿名通道）- 安全采集规范',
+    channel: 'GET /shopthelook 取匿名token -> POST /stylesnap/upload -> JSON(bbxAsinList)',
+    endpoints: {
+      image_search: 'GET/POST /api/image-search  GET: ?image=URL&country=com&lang=en  POST body: { image, country, lang }',
+      sites: 'GET /api/sites',
+      proxy_status: 'GET /api/proxy/status',
+      proxy_refresh: 'GET/POST /api/proxy/refresh',
+      proxy_seeds: 'POST /api/proxy/seeds  body: { proxies: [...] }',
+    },
+    supported_sites: sites.getAllSiteKeys(),
+    limits: {
+      image_max: '5MB',
+      image_types: ['jpeg', 'png'],
+      rate: '12次/分钟/IP',
+      proxy_mode: 'forced',
     },
     proxy_status: proxyManager.getStatus(),
   });
 });
-// ============ 站点列表 ============
+
 app.get('/api/sites', (req, res) => {
-  const siteList = Object.entries(sites.SITES).map(([code, config]) => ({
-    code,
-    domain: config.domain,
-    country: config.country,
-    currency: config.currency,
-    language: config.language,
-  }));
-  res.json(siteList);
+  res.json(Object.entries(sites.SITES).map(([code, c]) => ({ code, ...c })));
 });
-// ============ 搜索商品 ============
-app.get('/api/search', async (req, res) => {
+
+// ============ 核心：图搜（GET & POST 共用）============
+async function handleImageSearch(req, res) {
+  const clientKey = req.ip || (req.headers['x-forwarded-for'] || '').toString().split(',')[0].trim() || 'unknown';
+  if (!limiter.check(clientKey)) {
+    return res.status(429).json({
+      success: false,
+      data_version: DATA_VERSION,
+      error: '请求过于频繁，限流：每分钟最多12次',
+    });
+  }
+  // GET 从 query 读，POST 从 body 读
+  const src = req.method === 'GET' ? (req.query || {}) : (req.body || {});
+  const { image, country = 'com', lang = 'en' } = src;
   try {
-    const { keyword, country = 'com', lang = 'en', page = 1 } = req.query;
-    if (!keyword) {
-      return res.status(400).json({ success: false, error: 'keyword参数必填' });
+    if (!image) {
+      return res.status(400).json({ success: false, data_version: DATA_VERSION, error: 'image 参数必填（GET 用 ?image=https://... 或 POST body.image）' });
     }
     if (!sites.getSiteConfig(country)) {
       return res.status(400).json({
         success: false,
+        data_version: DATA_VERSION,
         error: `不支持的站点: ${country}`,
-        supported_sites: sites.getAllSiteKeys()
+        supported_sites: sites.getAllSiteKeys(),
       });
     }
-    // 强制启用代理
-    proxyManager.setEnabled(true);
-    const result = await scraper.searchProducts(keyword, country, lang, parseInt(page));
-    res.json(result);
+
+    proxyManager.setEnabled(true); // 强制代理，不允许关闭
+    const result = await searchByImage({ image, country, lang });
+    const httpStatus = result.http_status || (result.success ? 200 : 502);
+    res.status(httpStatus).json(result);
   } catch (error) {
-    console.error('Search error:', error);
-    res.status(500).json({ success: false, error: error.message });
+    console.error('[ImageSearch] error:', error.code || error.message);
+    const status = error.code === 'ROBOTS_DENIED' || error.code === 'ROBOTS_UNKNOWN' ? 403 : 500;
+    res.status(status).json({ success: false, data_version: DATA_VERSION, error: error.message });
   }
-});
-// ============ 商品详情 ============
-app.get('/api/product/:asin', async (req, res) => {
-  try {
-    const { asin } = req.params;
-    const { country = 'com', lang = 'en' } = req.query;
-    if (!sites.getSiteConfig(country)) {
-      return res.status(400).json({
-        success: false,
-        error: `不支持的站点: ${country}`,
-        supported_sites: sites.getAllSiteKeys()
-      });
-    }
-    // 强制启用代理
-    proxyManager.setEnabled(true);
-    const result = await scraper.getProductDetail(asin, country, lang);
-    res.json({ ...result, data_version: '1.1' });
-  } catch (error) {
-    console.error('Product detail error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-// ============ 代理状态 ============
+}
+app.get('/api/image-search', handleImageSearch);
+app.post('/api/image-search', handleImageSearch);
+
 app.get('/api/proxy/status', (req, res) => {
   res.json(proxyManager.getStatus());
 });
-// ============ 手动刷新代理池 ============
-app.post('/api/proxy/refresh', async (req, res) => {
+
+async function refreshProxiesEndpoint(req, res) {
   try {
     await proxyManager.refreshProxies(true);
     res.json({ success: true, ...proxyManager.getStatus() });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
   }
+}
+app.get('/api/proxy/refresh', refreshProxiesEndpoint);
+app.post('/api/proxy/refresh', refreshProxiesEndpoint);
+
+// 运维：热注入已验证代理种子（纯内网运维接口，仅接受 host:port / scheme://host:port）
+app.post('/api/proxy/seeds', (req, res) => {
+  const list = (req.body && req.body.proxies) || [];
+  if (!Array.isArray(list) || !list.every(p => typeof p === 'string' && /^(?:socks[45]h?:\/\/)?[\d.]+:\d{2,5}$/.test(p))) {
+    return res.status(400).json({ success: false, error: 'proxies 必须为 host:port 字符串数组' });
+  }
+  res.json({ success: true, ...proxyManager.addSeeds(list) });
 });
-app.post('/api/proxy/toggle', (req, res) => {
-  proxyManager.setEnabled(true);
-  res.json({ success: true, proxy_enabled: true, note: '代理模式为强制开启状态' });
-});
-// ============ 兜底路由（返回JSON而非默认404页面）============
+
+// 兜底路由（返回JSON而非默认404页面）
 app.use((req, res) => {
   res.status(404).json({
     success: false,
     error: `路径不存在: ${req.method} ${req.path}`,
     available_endpoints: [
-      'GET /',
       'GET /health',
+      'GET /',
       'GET /api/sites',
-      'GET /api/search?keyword=xxx&country=com&lang=en&page=1',
-      'GET /api/product/:asin?country=com&lang=en',
+      'GET/POST /api/image-search',
       'GET /api/proxy/status',
-      'POST /api/proxy/refresh',
+      'GET/POST /api/proxy/refresh',
+      'POST /api/proxy/seeds',
     ],
   });
 });
-// ============ 关键：先启动服务器，再做后台初始化 ============
-// Render 健康检查需要服务立即响应，不能等代理池初始化
+
+// 先监听，再后台初始化代理池（Render健康检查需要服务立即响应）
 app.listen(PORT, '0.0.0.0', () => {
   console.log('========================================');
-  console.log('  Amazon Product API Pro 已启动');
-  console.log('  监听端口: ' + PORT);
-  console.log('  模式: 强制代理模式');
-  console.log('  站点数: ' + sites.getAllSiteKeys().length);
+  console.log('  Amazon Image Search API 已启动');
+  console.log('  端口:', PORT, ' 数据版本:', DATA_VERSION);
+  console.log('  模式: 强制代理 / robots校验 / 图片魔数校验');
   console.log('========================================');
-  // 服务启动后，后台静默初始化代理池（不阻塞请求）
+
   setTimeout(async () => {
     try {
-      console.log('[Init] 后台初始化代理池...');
       await proxyManager.refreshProxies(true);
-      // 启动自动刷新定时器（每5分钟，免费代理变化快）
-      proxyManager.startAutoRefresh(5);
       console.log('[Init] 代理池初始化完成');
     } catch (e) {
-      console.warn('[Init] 代理池初始化失败（不影响服务运行，请求时重试）:', e.message);
-      // 即使初始化失败，仍然启动定时器（5分钟后重试）
-      proxyManager.startAutoRefresh(5);
+      console.warn('[Init] 代理池初始化失败（不影响服务，请求时重试）:', e.message);
     }
   }, 1000);
 });
+
+// 5分钟定时刷新代理池，降低免费实例CPU/内存压力
+setInterval(async () => {
+  try {
+    await proxyManager.refreshProxies(false);
+  } catch (e) {
+    console.warn('[AutoRefresh] 代理刷新失败:', e.message);
+  }
+}, 300000);

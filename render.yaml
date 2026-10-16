@@ -1,15 +1,9 @@
 services:
   - type: web
-    name: amazon-product-api
+    name: amazon-image-api
     env: node
-    region: singapore
     plan: free
     buildCommand: npm install
     startCommand: node server.js
     healthCheckPath: /health
     autoDeploy: true
-    envVars:
-      - key: NODE_VERSION
-        value: "20"
-      - key: NODE_ENV
-        value: "production"

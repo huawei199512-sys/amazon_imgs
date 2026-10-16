@@ -1,17 +1,18 @@
 {
-  "name": "amazon-product-api",
+  "name": "amazon-image-api",
   "version": "1.0.0",
-  "description": "Amazon商品详情和关键字搜索API - 支持全球多站点",
+  "description": "Amazon图搜API（Amazon Lens Web通道）- 纯代理模式 + 采集安全规范",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test_full.js"
+    "test": "node test_image_search.js"
   },
   "dependencies": {
-    "express": "^4.18.0",
     "axios": "^1.6.0",
     "cheerio": "^1.0.0-rc.12",
     "cors": "^2.8.5",
+    "express": "^4.18.0",
+    "form-data": "^4.0.0",
     "http-proxy-agent": "^7.0.2",
     "https-proxy-agent": "^7.0.4",
     "socks-proxy-agent": "^7.0.0"
